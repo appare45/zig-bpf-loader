@@ -36,18 +36,10 @@ pub fn main(init: std.process.Init) !void {
     if (!e.header.is_64) {
         utils.fatal("Expect 64bit but got 32bit", .{});
     }
-    var symtab: ?[]const u8 = null;
-    defer if (symtab) |p| gpa.free(p);
     var prog_sec: ?elf.Section = null;
     var license: ?[]u8 = null;
     defer if (license) |p| gpa.free(p);
     for (e.sections) |sec| {
-        if (sec.shdr.sh_type == std.elf.SHT_SYMTAB) {
-            if (symtab != null) {
-                utils.fatal("Duplicate symbol tables", .{});
-            }
-            symtab = try sec.read(gpa, &file_reader);
-        }
         if (std.meta.stringToEnum(Bpf_Sections, sec.name)) |cmd| switch (cmd) {
             .license => {
                 license = try sec.read(gpa, &file_reader);
@@ -61,9 +53,6 @@ pub fn main(init: std.process.Init) !void {
         { // TODO: 複数の.textセクションを扱えるようにする
             prog_sec = sec;
         }
-    }
-    if (symtab == null) {
-        utils.fatal("Symbol table not found", .{});
     }
     if (prog_sec == null) {
         utils.fatal("Program not found", .{});

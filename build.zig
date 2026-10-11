@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -24,19 +24,21 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
-    const ebpf_mod = b.createModule(.{
-        .target = b.resolveTargetQuery(.{ .cpu_arch = .bpfel }),
-        .optimize = .debug,
-        .link_libc = false,
-    });
-    ebpf_mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
-    ebpf_mod.addCSourceFile(.{ .file = b.path("./testdata/simple.bpf.c") });
-    const bpf_obj = b.addObject(.{
-        .name = "simple",
-        .root_module = ebpf_mod,
-    });
-    const install_bpf = b.addInstallFile(bpf_obj.getEmittedBin(), "simple.bpf.o");
-    b.getInstallStep().dependOn(&install_bpf.step);
+    const io = b.graph.io;
+    const arena = b.graph.arena;
+
+    const testdir_path = b.path("testdata");
+    const testdata_dir = try b.root.openDir(io, "testdata/", .{ .iterate = true });
+    defer testdata_dir.close(io);
+
+    var walker = try testdata_dir.walk(arena);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, "bpf.c")) continue; // zigでもビルドできるようにするる?
+        const basename = std.mem.cutSuffix(u8, entry.basename, ".bpf.c") orelse continue;
+        addBpfProgram(b, testdir_path.path(b, entry.basename), basename);
+    }
 
     // `zig build run -- <args>`
     const run_cmd = b.addRunArtifact(exe);
@@ -53,4 +55,30 @@ pub fn build(b: *std.Build) void {
 
     // `zig build check`: compile only, useful for editor integration (ZLS).
     b.step("check", "Check if the app compiles").dependOn(&exe.step);
+}
+
+/// Builds one eBPF C source with both zig cc and clang, and installs the
+/// results as `<name>.bpf.o` and `<name>.clang.o`.
+fn addBpfProgram(b: *std.Build, src: std.Build.LazyPath, name: []const u8) void {
+    const ebpf_mod = b.createModule(.{
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .bpfel }),
+        .optimize = .debug,
+        .link_libc = false,
+    });
+    ebpf_mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+    ebpf_mod.addCSourceFile(.{ .file = src });
+    const bpf_obj = b.addObject(.{
+        .name = name,
+        .root_module = ebpf_mod,
+    });
+    const install_bpf = b.addInstallFile(bpf_obj.getEmittedBin(), b.fmt("{s}.bpf.o", .{name}));
+    b.getInstallStep().dependOn(&install_bpf.step);
+
+    const clang_build = b.addSystemCommand(&.{ "clang", "-g", "-O2", "-Wall", "-target", "bpf", "-D__TARGET_ARCH_x64" });
+    clang_build.addArg("-c");
+    clang_build.addFileArg(src);
+    clang_build.addArg("-o");
+    const out = clang_build.addOutputFileArg("bpf_tmp");
+    const install_bpf_clang = b.addInstallFile(out, b.fmt("{s}.clang.o", .{name}));
+    b.getInstallStep().dependOn(&install_bpf_clang.step);
 }

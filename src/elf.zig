@@ -6,10 +6,19 @@ const Allocator = std.mem.Allocator;
 pub const Section = struct {
     name: []const u8,
     shdr: elf.Elf64_Shdr,
+    endian: std.builtin.Endian,
 
+    /// Reads the whole section into a newly allocated buffer. Caller owns the result.
     pub fn read(self: Section, gpa: Allocator, file_reader: *Io.File.Reader) ![]u8 {
         try file_reader.seekTo(self.shdr.sh_offset);
         return file_reader.interface.readAlloc(gpa, @intCast(self.shdr.sh_size));
+    }
+
+    /// Reads a `T` from the start of the section, without allocating.
+    pub fn readAs(self: Section, comptime T: type, file_reader: *Io.File.Reader, offset: usize) !T {
+        if (@sizeOf(T) > self.shdr.sh_size) return error.SectionTooSmall;
+        try file_reader.seekTo(self.shdr.sh_offset + offset);
+        return file_reader.interface.takeStruct(T, self.endian);
     }
 };
 
@@ -54,7 +63,7 @@ pub const Elf = struct {
         var it = header.iterateSectionHeaders(file_reader);
         var n: usize = 0;
         while (try it.next()) |shdr| : (n += 1) {
-            sections[n] = .{ .name = "", .shdr = shdr };
+            sections[n] = .{ .name = "", .shdr = shdr, .endian = header.endian };
         }
 
         const shstrtab = try readStringTable(gpa, file_reader, sections[header.shstrndx]);

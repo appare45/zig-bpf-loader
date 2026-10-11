@@ -2,11 +2,14 @@ const std = @import("std");
 const elf = @import("./elf.zig");
 const Io = std.Io;
 const utils = @import("./utils.zig");
+const Btf = @import("./btf.zig").Btf;
 const BPF = std.os.linux.BPF;
 
 // const BPF_PROG_TYPE_XDP = 1;
 const Bpf_Sections = enum {
     license,
+    @".maps",
+    @".BTF",
 };
 
 const BPF_LICENSE = enum {
@@ -37,12 +40,25 @@ pub fn main(init: std.process.Init) !void {
         utils.fatal("Expect 64bit but got 32bit", .{});
     }
     var prog_sec: ?elf.Section = null;
+    var btf: ?Btf = null;
+    defer if (btf) |*b| b.deinit(gpa);
+    var maps_sec: ?elf.Section = null;
     var license: ?[]u8 = null;
     defer if (license) |p| gpa.free(p);
     for (e.sections) |sec| {
         if (std.meta.stringToEnum(Bpf_Sections, sec.name)) |cmd| switch (cmd) {
             .license => {
                 license = try sec.read(gpa, &file_reader);
+                continue;
+            },
+            .@".maps" => {
+                maps_sec = sec;
+                continue;
+            },
+            .@".BTF" => {
+                const data = try sec.read(gpa, &file_reader);
+                defer gpa.free(data);
+                btf = try Btf.init(gpa, data, sec.endian);
                 continue;
             },
         };
@@ -55,13 +71,25 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (prog_sec == null) {
-        utils.fatal("Program not found", .{});
+        return error.ProgramNotFound;
     }
-    const prog: []const u8 = try prog_sec.?.read(gpa, &file_reader); // TODO: 複数のprogセクションを扱えるようにする
+    if (maps_sec != null) {
+        std.log.info("Map section found", .{});
+        if (btf == null) {
+            return error.BTFNotFound;
+        }
+        std.debug.print("{f}", .{btf.?}); // TODO: BtfHeader.sizeを読んで無効な値を使えなくする
+    }
+    const license_buf = license orelse return error.LicenseNotFound;
+    try loadProgram(gpa, &file_reader, prog_sec.?, license_buf);
+}
+
+fn loadProgram(gpa: std.mem.Allocator, file_reader: *Io.File.Reader, prog_sec: elf.Section, license: []const u8) !void {
+    const prog: []const u8 = try prog_sec.read(gpa, file_reader); // TODO: 複数のprogセクションを扱えるようにする
     defer gpa.free(prog);
 
     var prog_name: [16]u8 = @splat(0);
-    const s = prog_sec.?.name;
+    const s = prog_sec.name;
     const n = @min(prog_name.len, s.len);
     @memcpy(prog_name[0..n], s[0..n]);
     const insn_cnt = prog.len / @sizeOf(BPF.Insn);
@@ -70,9 +98,9 @@ pub fn main(init: std.process.Init) !void {
     var attr = BPF.Attr{
         .prog_load = .{
             .prog_type = @intFromEnum(BPF.ProgType.xdp),
-            .insn_cnt = std.math.cast(u32, insn_cnt) orelse return,
+            .insn_cnt = std.math.cast(u32, insn_cnt) orelse return error.TooManyInstructions,
             .insns = @intFromPtr(prog.ptr),
-            .license = @intFromPtr(license.?.ptr),
+            .license = @intFromPtr(license.ptr),
             .log_level = 3,
             .log_size = log_size,
             .log_buf = @intFromPtr(&log_buf),
@@ -97,7 +125,8 @@ pub fn main(init: std.process.Init) !void {
     const fd = std.os.linux.bpf(.prog_load, &attr, @sizeOf(@TypeOf(attr)));
     std.log.info("log from kernel:\n{s}", .{log_buf});
     if (fd < 0) {
-        utils.fatal("Failed to load {s}", .{@tagName(std.posix.errno(fd))});
+        std.log.err("Failed to load {s}", .{@tagName(std.posix.errno(fd))});
+        return error.ProgLoadFailed;
     }
     std.log.info("Successfully loaded fd: {d}", .{fd});
 }

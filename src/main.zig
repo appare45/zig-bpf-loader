@@ -1,9 +1,12 @@
 const std = @import("std");
-const elf = @import("./elf.zig");
 const Io = std.Io;
-const utils = @import("./utils.zig");
-const Btf = @import("./btf.zig").Btf;
 const BPF = std.os.linux.BPF;
+
+const btf_mod = @import("./btf.zig");
+const Btf = btf_mod.Btf;
+const MapDef = @import("./map.zig").MapDef;
+const elf = @import("./elf.zig");
+const utils = @import("./utils.zig");
 
 // const BPF_PROG_TYPE_XDP = 1;
 const Bpf_Sections = enum {
@@ -43,6 +46,12 @@ pub fn main(init: std.process.Init) !void {
     var btf: ?Btf = null;
     defer if (btf) |*b| b.deinit(gpa);
     var maps_sec: ?elf.Section = null;
+    // TODO: プログラム内の &map リロケーションにfdを書き込む
+    var map_fds: std.ArrayList(i32) = .empty; // 型として独立させてもいいかも
+    defer {
+        for (map_fds.items) |fd| _ = std.os.linux.close(fd);
+        map_fds.deinit(gpa);
+    }
     var license: ?[]u8 = null;
     defer if (license) |p| gpa.free(p);
     for (e.sections) |sec| {
@@ -78,7 +87,15 @@ pub fn main(init: std.process.Init) !void {
         if (btf == null) {
             return error.BTFNotFound;
         }
-        std.debug.print("{f}", .{btf.?}); // TODO: BtfHeader.sizeを読んで無効な値を使えなくする
+        const maps = try MapDef.fromBtf(gpa, &btf.?);
+        defer gpa.free(maps);
+        for (maps) |m| std.log.info("map {f}", .{m});
+        for (maps) |m| {
+            const map_fd = try m.create();
+            try map_fds.append(gpa, map_fd);
+            std.log.info("created map '{s}' fd={d}", .{ m.name, map_fd });
+        }
+        std.log.debug("BTF Dump: {f}", .{btf.?}); // TODO: BtfHeader.sizeを読んで無効な値を使えなくする
     }
     const license_buf = license orelse return error.LicenseNotFound;
     try loadProgram(gpa, &file_reader, prog_sec.?, license_buf);
@@ -95,38 +112,22 @@ fn loadProgram(gpa: std.mem.Allocator, file_reader: *Io.File.Reader, prog_sec: e
     const insn_cnt = prog.len / @sizeOf(BPF.Insn);
     const log_size = 4096;
     var log_buf: [log_size]u8 = @splat(0);
-    var attr = BPF.Attr{
-        .prog_load = .{
-            .prog_type = @intFromEnum(BPF.ProgType.xdp),
-            .insn_cnt = std.math.cast(u32, insn_cnt) orelse return error.TooManyInstructions,
-            .insns = @intFromPtr(prog.ptr),
-            .license = @intFromPtr(license.ptr),
-            .log_level = 3,
-            .log_size = log_size,
-            .log_buf = @intFromPtr(&log_buf),
-            // BTFになってからは使ってないらしい
-            .kern_version = 0,
-            .prog_flags = 0,
-            .prog_name = prog_name[0..16].*,
-            .prog_ifindex = 0,
-            .expected_attach_type = @intFromEnum(BPF.AttachType.xdp),
-            // TODO: BTF対応
-            .prog_btf_fd = -1,
-            .func_info_rec_size = 0,
-            .func_info = 0,
-            .func_info_cnt = 0,
-            .line_info_rec_size = 0,
-            .line_info = 0,
-            .line_info_cnt = 0,
-            .attact_btf_id = 0,
-            .attach_prog_id = 0,
-        },
-    };
-    const fd = std.os.linux.bpf(.prog_load, &attr, @sizeOf(@TypeOf(attr)));
+    var attr = BPF.Attr{ .prog_load = std.mem.zeroes(BPF.ProgLoadAttr) };
+    const pl = &attr.prog_load;
+    pl.prog_type = @intFromEnum(BPF.ProgType.xdp); // TODO: ちゃんとELFファイルのセクション名をパースする
+    pl.insn_cnt = std.math.cast(u32, insn_cnt) orelse return error.TooManyInstructions;
+    pl.insns = @intFromPtr(prog.ptr);
+    pl.license = @intFromPtr(license.ptr);
+    pl.log_level = 3;
+    pl.log_size = log_size;
+    pl.log_buf = @intFromPtr(&log_buf);
+    pl.prog_name = prog_name;
+    pl.expected_attach_type = @intFromEnum(BPF.AttachType.xdp);
+    const rc = std.os.linux.bpf(.prog_load, &attr, @sizeOf(BPF.ProgLoadAttr));
     std.log.info("log from kernel:\n{s}", .{log_buf});
-    if (fd < 0) {
-        std.log.err("Failed to load {s}", .{@tagName(std.posix.errno(fd))});
+    if (std.posix.errno(rc) != .SUCCESS) {
+        std.log.err("Failed to load {s}", .{@tagName(std.posix.errno(rc))});
         return error.ProgLoadFailed;
     }
-    std.log.info("Successfully loaded fd: {d}", .{fd});
+    std.log.info("Successfully loaded fd: {d}", .{rc});
 }

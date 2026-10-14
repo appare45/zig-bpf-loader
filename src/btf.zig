@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const StringTable = @import("utils.zig").StringTable;
 
 pub const BtfHeader = extern struct {
     magic: u16,
@@ -24,14 +25,11 @@ pub const BtfHeader = extern struct {
 
 pub const BtfType = struct {
     info: BtfTypeHead.Info,
-    name: ?[]const u8,
+    /// Offset into the string table, resolve with `Btf.strings.get`.
+    name_off: u32,
+    /// `size` for int/struct/union/enum/enum64/float, otherwise the referenced type id.
+    size_or_type: u32,
     body: BtfTypeBody,
-
-    pub fn format(self: BtfType, w: *Io.Writer) Io.Writer.Error!void {
-        try w.print("{f}", .{self.info});
-        if (self.name) |n| try w.print(" '{s}'", .{n});
-        try w.print(" {f}", .{self.body});
-    }
 };
 
 pub const BtfTypeBody = union(enum) {
@@ -61,9 +59,9 @@ pub const BtfTypeBody = union(enum) {
         }
     }
 
-    const VarSecInfo = extern struct { type: u32, offset: u32, size: u32 };
-    const Array = extern struct { type: u32, index_type: u32, nelems: u32 };
-    const Member = extern struct { name_off: u32, type: u32, offset: u32 };
+    pub const VarSecInfo = extern struct { type: u32, offset: u32, size: u32 };
+    pub const Array = extern struct { type: u32, index_type: u32, nelems: u32 };
+    pub const Member = extern struct { name_off: u32, type: u32, offset: u32 };
     const Enum = extern struct { name_off: u32, val: i32 };
     const Enum64 = extern struct { name_off: u32, val_lo32: u32, val_hi32: u32 };
     const Param = extern struct { name_off: u32, type: u32 };
@@ -79,7 +77,6 @@ pub const BtfTypeBody = union(enum) {
         };
     };
 
-    const VarSecinfo = extern struct { type: u32, offset: u32, size: u32 };
     const DeclTag = extern struct { component_idx: i32 };
 
     const LocParam = struct { flags: u32, values: []u32 };
@@ -137,10 +134,10 @@ pub const Btf = struct {
     header: BtfHeader,
     /// `types[i]` has BTF type id `i + 1` (id 0 is the implicit `void`).
     types: []BtfType,
-    /// Copy of the string table; `BtfType.name` slices point into this.
-    strings: []u8,
+    /// Copy of the string table, query it with `strings.get`.
+    strings: StringTable,
 
-    pub const Error = error{ BtfBadMagic, BtfTruncated, BtfUnknownKind } || std.mem.Allocator.Error || Io.Reader.Error;
+    pub const Error = error{ BtfBadMagic, BtfTruncated, BtfUnknownKind } || std.mem.Allocator.Error || StringTable.Error || Io.Reader.Error;
 
     /// Parses a whole `.BTF` section. The result does not borrow from `data`.
     pub fn init(gpa: std.mem.Allocator, data: []const u8, endian: std.builtin.Endian) Error!Btf {
@@ -151,8 +148,8 @@ pub const Btf = struct {
         const str_start = @as(usize, header.hdr_len) + header.str_off;
         const str_end = str_start + header.str_len;
         if (str_end > data.len) return error.BtfTruncated;
-        const str = try gpa.dupe(u8, data[str_start..str_end]);
-        errdefer gpa.free(str);
+        const strs: StringTable = try .init(gpa, data[str_start..str_end]);
+        errdefer strs.deinit(gpa);
 
         const type_start = @as(usize, header.hdr_len) + header.type_off;
         const type_end = type_start + header.type_len;
@@ -167,7 +164,6 @@ pub const Btf = struct {
         while (tr.seek < tr.end) {
             const head = try tr.takeStruct(BtfTypeHead, endian);
             const n: usize = head.info.vlen;
-            const name: ?[]const u8 = if (head.name_off != 0) std.mem.sliceTo(str[head.name_off..], 0) else null;
             const body: BtfTypeBody = switch (head.info.kind) {
                 .unkn, .ptr, .fwd, .typedef, .@"volatile", .@"const", .restrict, .func, .float, .type_tag => .zero,
                 .int => .{ .int = try tr.takeInt(u32, endian) },
@@ -191,22 +187,80 @@ pub const Btf = struct {
                 _ => return error.BtfUnknownKind,
             };
             errdefer body.deinit(gpa);
-            try types.append(gpa, .{ .info = head.info, .name = name, .body = body });
+            try types.append(gpa, .{ .info = head.info, .name_off = head.name_off, .size_or_type = head.size_or_type.size, .body = body });
         }
-        return .{ .header = header, .types = try types.toOwnedSlice(gpa), .strings = str };
+        return .{ .header = header, .types = try types.toOwnedSlice(gpa), .strings = strs };
+    }
+
+    pub const DatasecError = error{BtfDatasecNotFound} || StringTable.Error;
+
+    /// Finds the DATASEC named `name` (e.g. `.maps`) and returns its variables.
+    /// もしかしたらセクション名＋nameで検索できたほうが嬉しいのかもしれない
+    pub fn findDatasec(self: *const Btf, name: []const u8) DatasecError![]const BtfTypeBody.VarSecInfo {
+        for (self.types) |t| {
+            if (t.body != .var_sec_info) continue;
+            if (std.mem.eql(u8, try self.strings.get(t.name_off), name)) return t.body.var_sec_info;
+        }
+        return error.BtfDatasecNotFound;
+    }
+
+    pub const TypeError = error{ BtfBadTypeId, BtfNoSize, BtfTooDeep };
+
+    /// Returns the type with BTF type id `id`. Id 0 (`void`) has no entry and gives null.
+    pub fn get(self: *const Btf, id: u32) ?*const BtfType {
+        if (id == 0 or id > self.types.len) return null;
+        return &self.types[id - 1];
+    }
+
+    /// Follows typedef/const/volatile/restrict/type_tag until a concrete type is reached.
+    pub fn skipModifiers(self: *const Btf, id: u32) TypeError!*const BtfType {
+        var cur = id;
+        for (0..max_depth) |_| {
+            const t = self.get(cur) orelse return error.BtfBadTypeId;
+            switch (t.info.kind) {
+                .typedef, .@"volatile", .@"const", .restrict, .type_tag => cur = t.size_or_type,
+                else => return t,
+            }
+        }
+        return error.BtfTooDeep;
+    }
+
+    /// Size in bytes of type `id`, like `sizeof` in C.
+    pub fn sizeOf(self: *const Btf, id: u32) TypeError!u32 {
+        return self.sizeOfDepth(id, 0);
+    }
+
+    const max_depth = 32;
+
+    fn sizeOfDepth(self: *const Btf, id: u32, depth: u32) TypeError!u32 {
+        if (depth > max_depth) return error.BtfTooDeep;
+        const t = try self.skipModifiers(id);
+        return switch (t.info.kind) {
+            .int, .@"struct", .@"union", .@"enum", .enum64, .float => t.size_or_type,
+            .ptr => 8, // TODO: ターゲットのポインタ幅(64bit固定)
+            .array => blk: {
+                const a = t.body.array;
+                break :blk std.math.mul(u32, a.nelems, try self.sizeOfDepth(a.type, depth + 1)) catch error.BtfNoSize;
+            },
+            else => error.BtfNoSize,
+        };
     }
 
     pub fn format(self: Btf, w: *Io.Writer) Io.Writer.Error!void {
         try w.print("BTF {f}\n", .{self.header});
         for (self.types, 1..) |t, id| {
-            try w.print("[{d}] {f}\n", .{ id, t });
+            try w.print("[{d}] {f}", .{ id, t.info });
+            if (self.strings.get(t.name_off)) |n| {
+                if (n.len != 0) try w.print(" '{s}'", .{n});
+            } else |_| try w.print(" <bad name_off={d}>", .{t.name_off});
+            try w.print(" size_or_type={d} {f}\n", .{ t.size_or_type, t.body });
         }
     }
 
     pub fn deinit(self: *Btf, gpa: std.mem.Allocator) void {
         for (self.types) |t| t.body.deinit(gpa);
         gpa.free(self.types);
-        gpa.free(self.strings);
+        self.strings.deinit(gpa);
         self.* = undefined;
     }
 };

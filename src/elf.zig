@@ -2,6 +2,7 @@ const std = @import("std");
 const elf = std.elf;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const StringTable = @import("utils.zig").StringTable;
 
 pub const Section = struct {
     name: []const u8,
@@ -19,21 +20,6 @@ pub const Section = struct {
         if (@sizeOf(T) > self.shdr.sh_size) return error.SectionTooSmall;
         try file_reader.seekTo(self.shdr.sh_offset + offset);
         return file_reader.interface.takeStruct(T, self.endian);
-    }
-};
-
-/// NUL-terminated strings packed back to back (.shstrtab / .strtab).
-pub const StringTable = struct {
-    data: []u8,
-
-    pub const Error = error{ StringOutOfRange, StringNotTerminated };
-
-    /// Returns the string starting at `offset`, borrowed from `data`.
-    pub fn get(self: StringTable, offset: u32) Error![]const u8 {
-        if (offset >= self.data.len) return error.StringOutOfRange;
-        const end = std.mem.indexOfScalarPos(u8, self.data, offset, 0) orelse
-            return error.StringNotTerminated;
-        return self.data[offset..end];
     }
 };
 
@@ -67,14 +53,14 @@ pub const Elf = struct {
         }
 
         const shstrtab = try readStringTable(gpa, file_reader, sections[header.shstrndx]);
-        errdefer gpa.free(shstrtab.data);
+        errdefer shstrtab.deinit(gpa);
 
         for (sections) |*sec| {
             sec.name = try shstrtab.get(sec.shdr.sh_name);
         }
 
         var strtab: ?StringTable = null;
-        errdefer if (strtab) |t| gpa.free(t.data);
+        errdefer if (strtab) |t| t.deinit(gpa);
         for (sections) |sec| {
             if (sec.shdr.sh_type != elf.SHT_SYMTAB) continue;
             if (sec.shdr.sh_link == elf.SHN_UNDEF or sec.shdr.sh_link >= sections.len) {
@@ -99,8 +85,8 @@ pub const Elf = struct {
 
     pub fn deinit(self: *Elf, gpa: Allocator) void {
         gpa.free(self.sections);
-        gpa.free(self.shstrtab.data);
-        if (self.strtab) |t| gpa.free(t.data);
+        self.shstrtab.deinit(gpa);
+        if (self.strtab) |t| t.deinit(gpa);
         self.* = undefined;
     }
 };

@@ -60,6 +60,7 @@ jobs:
             cat loader.log
             echo '```'
             echo "</details>"
+            echo
             echo "### bpftool map dump"
             echo '```'
             cat map_dump.log

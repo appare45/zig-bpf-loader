@@ -25,7 +25,6 @@ jobs:
         run: zig build
 
       - name: E2E (load, attach, count packets)
-        id: e2e
         run: |
           set -euxo pipefail
 
@@ -49,23 +48,25 @@ jobs:
 
           # ピンしたMapの中身を確認する
           sudo bpftool map dump pinned /sys/fs/bpf/pkt_count | tee map_dump.log
-          count=$(sudo bpftool -j map lookup pinned /sys/fs/bpf/pkt_count key 0 0 0 0 \
-            | jq '.value | if type=="array" then (.[0]) else . end')
-          echo "pkt_count=$count"
-          echo "pkt_count=$count" >> "$GITHUB_OUTPUT"
           {
             echo "## E2E result"
-            echo "- pkt_count: \`$count\`"
-            echo "### Loader log"
+            echo "### Loader log (info)"
+            echo '```'
+            grep '^info:' loader.log || true
+            echo '```'
+            echo "<details><summary>Full loader log</summary>"
+            echo
             echo '```'
             cat loader.log
             echo '```'
+            echo "</details>"
             echo "### bpftool map dump"
             echo '```'
             cat map_dump.log
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          test "$count" -gt 0
+          # カウンタが0のままならパケットがXDPに届いていない
+          ! grep -q 'value: \(00 \)*00$' map_dump.log
 
       - name: Cleanup
         if: always()

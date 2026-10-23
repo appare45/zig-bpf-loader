@@ -3,6 +3,8 @@ const btf_mod = @import("./btf.zig");
 const Btf = btf_mod.Btf;
 const VarSecInfo = btf_mod.BtfTypeBody.VarSecInfo;
 const BPF = std.os.linux.BPF;
+const elf = @import("./elf.zig");
+const utils = @import("./utils.zig");
 
 /// One map declared in the `.maps` section, e.g.
 ///
@@ -140,3 +142,30 @@ pub const CreatedMap = struct {
 /// Created maps by their offset in the `.maps` section, which is what a program relocation's symbol
 /// (`st_value`) refers to.
 pub const CreatedMaps = std.AutoHashMapUnmanaged(u32, CreatedMap);
+
+/// Closes every fd and frees the table.
+pub fn deinitCreated(maps: *CreatedMaps, gpa: std.mem.Allocator) void {
+    var it = maps.valueIterator();
+    while (it.next()) |m| _ = std.os.linux.close(m.fd);
+    maps.deinit(gpa);
+}
+
+/// Creates (and pins) every map declared in the `.maps` section. `sec_offset` of each def is
+/// resolved from `.symtab` via `e`. The caller owns the fds in the result (`deinitCreated`).
+pub fn createAll(gpa: std.mem.Allocator, e: *const elf.Elf, btf: *const Btf, maps_idx: usize) !CreatedMaps {
+    const maps = try MapDef.fromBtf(gpa, btf);
+    defer gpa.free(maps); // nameはbtfを借りているのでスライスだけ解放してよい
+    for (maps) |*m| m.sec_offset = std.math.cast(u32, try e.symbolOffset(m.name, maps_idx)) orelse return error.MapOffsetTooLarge;
+
+    var created: CreatedMaps = .empty;
+    errdefer deinitCreated(&created, gpa);
+    for (maps) |m| {
+        std.log.info("map {f}", .{m});
+        const map_fd = try m.create();
+        errdefer _ = std.os.linux.close(map_fd);
+        try created.put(gpa, m.sec_offset, .{ .def = m, .fd = map_fd });
+        std.log.info("created map '{s}' fd={d}", .{ m.name, map_fd });
+        try utils.pinObject(map_fd, m.name);
+    }
+    return created;
+}

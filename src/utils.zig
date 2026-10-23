@@ -5,6 +5,26 @@ pub fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(1);
 }
 
+/// bpffs (`mount -t bpf`) の通常のマウント先。ここにpinしたオブジェクトはプロセスが終わっても残る。
+const pin_dir = "/sys/fs/bpf";
+
+/// `BPF_OBJ_PIN`: bpffsの`pin_dir/name`にfdのオブジェクト(プログラム/マップ)を固定する。
+pub fn pinObject(fd: i32, name: []const u8) !void {
+    const BPF = std.os.linux.BPF;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ pin_dir, name }, 0);
+    var attr: BPF.Attr = .{ .obj = std.mem.zeroes(BPF.ObjAttr) };
+    attr.obj.pathname = @intFromPtr(path.ptr);
+    attr.obj.bpf_fd = fd;
+    const rc = std.os.linux.bpf(.obj_pin, &attr, @sizeOf(BPF.ObjAttr));
+    const errno = std.posix.errno(rc);
+    if (errno != .SUCCESS) {
+        std.log.err("BPF_OBJ_PIN '{s}' failed: {s}", .{ path, @tagName(errno) });
+        return error.ObjPinFailed;
+    }
+    std.log.info("pinned fd={d} at {s}", .{ fd, path });
+}
+
 /// NUL-terminated strings packed back to back (.shstrtab / .strtab).
 pub const StringTable = struct {
     data: []u8,

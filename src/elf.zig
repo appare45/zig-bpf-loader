@@ -15,6 +15,15 @@ pub const Section = struct {
         return file_reader.interface.readAlloc(gpa, @intCast(self.shdr.sh_size));
     }
 
+    /// Reads a `SHT_REL` section into relocation entries. Caller owns the result.
+    pub fn readRelocations(self: Section, gpa: Allocator, file_reader: *Io.File.Reader) ![]elf.Elf64_Rel {
+        if (self.shdr.sh_type != elf.SHT_REL) return error.NotRelocationSection;
+        const entry_size = @sizeOf(elf.Elf64_Rel);
+        if (self.shdr.sh_size % entry_size != 0) return error.InvalidRelocationSection;
+        try file_reader.seekTo(self.shdr.sh_offset);
+        return file_reader.interface.readSliceEndianAlloc(gpa, elf.Elf64_Rel, self.shdr.sh_size / entry_size, self.endian);
+    }
+
     /// Reads a `T` from the start of the section, without allocating.
     pub fn readAs(self: Section, comptime T: type, file_reader: *Io.File.Reader, offset: usize) !T {
         if (@sizeOf(T) > self.shdr.sh_size) return error.SectionTooSmall;
@@ -29,6 +38,8 @@ pub const Elf = struct {
     shstrtab: StringTable,
     /// Symbol names, pointed to by the `sh_link` of `.symtab`. Null if there is no `.symtab`.
     strtab: ?StringTable,
+    /// Entries of `.symtab`, which is what `Elf64_Rel.r_sym()` indexes. Empty if there is none.
+    symbols: []elf.Elf64_Sym,
     sections: []Section,
 
     pub const InitError = error{
@@ -61,16 +72,20 @@ pub const Elf = struct {
 
         var strtab: ?StringTable = null;
         errdefer if (strtab) |t| t.deinit(gpa);
+        var symbols: []elf.Elf64_Sym = &.{};
+        errdefer gpa.free(symbols);
         for (sections) |sec| {
             if (sec.shdr.sh_type != elf.SHT_SYMTAB) continue;
             if (sec.shdr.sh_link == elf.SHN_UNDEF or sec.shdr.sh_link >= sections.len) {
                 return error.InvalidSymtabLink;
             }
             strtab = try readStringTable(gpa, file_reader, sections[sec.shdr.sh_link]);
+            try file_reader.seekTo(sec.shdr.sh_offset);
+            symbols = try file_reader.interface.readSliceEndianAlloc(gpa, elf.Elf64_Sym, sec.shdr.sh_size / @sizeOf(elf.Elf64_Sym), header.endian);
             break;
         }
 
-        return .{ .header = header, .shstrtab = shstrtab, .strtab = strtab, .sections = sections };
+        return .{ .header = header, .shstrtab = shstrtab, .strtab = strtab, .symbols = symbols, .sections = sections };
     }
 
     fn readStringTable(gpa: Allocator, file_reader: *Io.File.Reader, sec: Section) !StringTable {
@@ -83,8 +98,27 @@ pub const Elf = struct {
         return strtab.get(st_name);
     }
 
+    /// `st_value` of the symbol `name` defined in section `shndx`, i.e. its offset inside that section.
+    pub fn symbolOffset(self: *const Elf, name: []const u8, shndx: usize) !u64 {
+        for (self.symbols) |sym| {
+            if (sym.st_shndx != shndx) continue;
+            if (std.mem.eql(u8, try self.symName(sym.st_name), name)) return sym.st_value;
+        }
+        return error.SymbolNotFound;
+    }
+
+    /// Name of the function symbol defined in section `shndx`, like the program name libbpf uses.
+    pub fn funcName(self: *const Elf, shndx: usize) ?[]const u8 {
+        for (self.symbols) |sym| {
+            if (sym.st_shndx != shndx or (sym.st_info & 0xf) != elf.STT_FUNC) continue;
+            return self.symName(sym.st_name) catch null;
+        }
+        return null;
+    }
+
     pub fn deinit(self: *Elf, gpa: Allocator) void {
         gpa.free(self.sections);
+        gpa.free(self.symbols);
         self.shstrtab.deinit(gpa);
         if (self.strtab) |t| t.deinit(gpa);
         self.* = undefined;

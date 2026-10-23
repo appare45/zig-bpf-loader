@@ -25,9 +25,8 @@ pub const MapDef = struct {
     /// BTF type ids of key/value, 0 if declared with `key_size`/`value_size`.
     key_type_id: u32 = 0,
     value_type_id: u32 = 0,
-    /// Offset recorded in the BTF DATASEC. This is always 0 in an unlinked `.o`: libbpf fills in
-    /// the real offset from `.symtab` (`st_value`), which is what program relocations refer to.
-    /// TODO: .symtab からオフセットを引いてリロケーションと突き合わせる
+    /// Offset in the `.maps` section. The BTF DATASEC records 0 for it in an unlinked `.o`, so the
+    /// caller fills in the real offset from `.symtab` (`st_value`), which program relocations refer to.
     sec_offset: u32,
 
     pub const Error = error{
@@ -131,3 +130,13 @@ pub const MapDef = struct {
         );
     }
 };
+
+/// A map that has been created in the kernel. The owner closes `fd`.
+pub const CreatedMap = struct {
+    def: MapDef,
+    fd: i32,
+};
+
+/// Created maps by their offset in the `.maps` section, which is what a program relocation's symbol
+/// (`st_value`) refers to.
+pub const CreatedMaps = std.AutoHashMapUnmanaged(u32, CreatedMap);

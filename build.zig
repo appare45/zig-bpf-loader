@@ -28,6 +28,7 @@ pub fn build(b: *std.Build) !void {
     const arena = b.graph.arena;
 
     const testdir_path = b.path("testdata");
+    b.dependOnDirectoryContents(testdir_path);
     const testdata_dir = try b.root.openDir(io, "testdata/", .{ .iterate = true });
     defer testdata_dir.close(io);
 
@@ -66,6 +67,8 @@ fn addBpfProgram(b: *std.Build, src: std.Build.LazyPath, name: []const u8) void 
         .link_libc = false,
     });
     ebpf_mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+    // Debian/Ubuntuでは asm/*.h がここにある
+    ebpf_mod.addSystemIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu" });
     ebpf_mod.addCSourceFile(.{ .file = src });
     const bpf_obj = b.addObject(.{
         .name = name,
@@ -74,7 +77,7 @@ fn addBpfProgram(b: *std.Build, src: std.Build.LazyPath, name: []const u8) void 
     const install_bpf = b.addInstallFile(bpf_obj.getEmittedBin(), b.fmt("{s}.bpf.o", .{name}));
     b.getInstallStep().dependOn(&install_bpf.step);
 
-    const clang_build = b.addSystemCommand(&.{ "clang", "-g", "-O2", "-Wall", "-target", "bpf", "-D__TARGET_ARCH_x64" });
+    const clang_build = b.addSystemCommand(&.{ "clang", "-g", "-O2", "-Wall", "-target", "bpf", "-D__TARGET_ARCH_x64", "-I/usr/include/x86_64-linux-gnu" });
     clang_build.addArg("-c");
     clang_build.addFileArg(src);
     clang_build.addArg("-o");

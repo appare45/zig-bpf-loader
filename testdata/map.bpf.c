@@ -17,7 +17,7 @@ int xdp_count(struct xdp_md *ctx)
 	if (value)
 		__sync_fetch_and_add(value, 1);
 
-	return XDP_PASS;
+	return XDP_DROP;
 }
 
 char LICENSE[] SEC("license") = "GPL";

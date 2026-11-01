@@ -2,7 +2,7 @@
 #include <bpf/bpf_helpers.h>
 
 SEC("xdp")
-int xdp_pass(struct xdp_md *ctx)
+int xdp_drop(struct xdp_md *ctx)
 {
 	return XDP_DROP;
 }
